@@ -3,6 +3,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <string.h>
 
 #include "config.h"
 #include "sensor_interface.h"
@@ -13,7 +14,7 @@ static PubSubClient mqtt(espClient);
 
 static unsigned long last_publish_ms = 0;
 
-// ---------------- WiFi ----------------
+// ================= WiFi =================
 static void connectWiFi()
 {
   Serial.printf("[WiFi] Connecting to %s\n", WIFI_SSID);
@@ -37,13 +38,13 @@ static void connectWiFi()
                 WiFi.localIP().toString().c_str());
 }
 
-// ---------------- MQTT ----------------
+// ================= MQTT =================
 static void connectMQTT()
 {
   while (!mqtt.connected())
   {
     Serial.print("[MQTT] Connecting... ");
-    String clientId = String("esp32-") + NODE_ID + "-" +
+    String clientId = String("xiao-master-") +
                       String((uint32_t)esp_random(), HEX);
     if (mqtt.connect(clientId.c_str()))
     {
@@ -57,7 +58,7 @@ static void connectMQTT()
   }
 }
 
-// ---------------- Time ----------------
+// ================= Time =================
 static String isoTimestamp()
 {
   time_t now = time(nullptr);
@@ -71,47 +72,83 @@ static String isoTimestamp()
   return String(buf);
 }
 
-// ---------------- Publish ----------------
-static void publishReading()
+// ================= Publish one node =================
+static void publishNode(const NodeData &n, const String &ts)
 {
-  SensorReading s = sensors_read();
-  GpsReading g = gps_read();
-  float fused = fuse_temperature(s);
-
   JsonDocument doc;
-  doc["node_id"] = NODE_ID;
-  doc["timestamp"] = isoTimestamp();
-  doc["latitude"] = serialized(String(g.latitude, 6));
-  doc["longitude"] = serialized(String(g.longitude, 6));
-  doc["gps_valid"] = g.valid;
-  doc["t1"] = serialized(String(s.t1, 3));
-  doc["t2"] = serialized(String(s.t2, 3));
-  doc["temperature"] = serialized(String(fused, 3));
+  doc["node_id"] = n.node_id;
+  doc["timestamp"] = ts;
+  doc["latitude"] = n.latitude;
+  doc["longitude"] = n.longitude;
+  doc["gps_valid"] = n.valid;
+  doc["t1"] = n.sensors.t1;
+  doc["t2"] = n.sensors.t2;
+  doc["temperature"] = n.fused;
   doc["rssi"] = WiFi.RSSI();
+  doc["source"] = n.is_master ? "self" : "lora";
 
   char payload[512];
-  size_t n = serializeJson(doc, payload, sizeof(payload));
+  size_t len = serializeJson(doc, payload, sizeof(payload));
 
-  Serial.printf("[PUB] %s\n", payload);
+  String topic = String(MQTT_TOPIC_PREFIX) + n.node_id + "/data";
 
-  if (!mqtt.publish(MQTT_TOPIC, payload, n))
-  {
-    Serial.println("[MQTT] publish failed");
-  }
+  bool ok = mqtt.publish(topic.c_str(), payload, len);
+  Serial.printf("[PUB] %-28s %s\n", topic.c_str(), ok ? "ok" : "FAIL");
 }
 
-// ---------------- Arduino entry points ----------------
+// ================= Build all node data =================
+static size_t buildNodeData(NodeData *out, size_t max_count)
+{
+  size_t n = 0;
+
+  // ----- Master's own entry (index 0) -----
+  if (n < max_count)
+  {
+    NodeData &m = out[n];
+    strncpy(m.node_id, NODE_DEFS[MASTER_NODE_INDEX].node_id,
+            sizeof(m.node_id) - 1);
+    m.node_id[sizeof(m.node_id) - 1] = '\0';
+
+    GpsReading g = master_gps_read();
+    m.latitude = g.latitude;
+    m.longitude = g.longitude;
+    m.valid = g.valid;
+    m.sensors = master_sensors_read();
+    m.is_master = true;
+
+    fusion_set_slot(0);
+    m.fused = fuse_temperature(m.sensors);
+    ++n;
+  }
+
+  // ----- Remote LoRa nodes (index 1..N) -----
+  size_t remotes = remote_nodes_read(out + n, max_count - n);
+  for (size_t i = 0; i < remotes; ++i)
+  {
+    fusion_set_slot((int)(n + i));
+    out[n + i].fused = fuse_temperature(out[n + i].sensors);
+  }
+  n += remotes;
+
+  return n;
+}
+
+// ================= Arduino entry points =================
 void setup()
 {
   Serial.begin(115200);
-  delay(300);
-  Serial.println("\n=== EE2120 Distributed Temperature Node ===");
-  Serial.printf("Node ID     : %s\n", NODE_ID);
-  Serial.printf("Dummy mode  : sensors=%d gps=%d\n",
-                (int)USE_DUMMY_SENSORS, (int)USE_DUMMY_GPS);
+  delay(500);
+  Serial.println("\n=== EE2120 Master Gateway (XIAO ESP32S3) ===");
+  Serial.printf("Master ID   : %s\n", NODE_DEFS[0].node_id);
+  Serial.printf("Remote nodes: %u\n", (unsigned)REMOTE_NODE_COUNT);
+  Serial.printf("Dummy modes : sensors=%d gps=%d lora=%d\n",
+                (int)USE_DUMMY_SENSORS,
+                (int)USE_DUMMY_GPS,
+                (int)USE_DUMMY_REMOTE_NODES);
 
-  sensors_init();
-  gps_init();
+  master_sensors_init();
+  master_gps_init();
+  remote_nodes_init();
 
   connectWiFi();
   configTime(0, 0, NTP_SERVER); // UTC
@@ -123,19 +160,26 @@ void setup()
 void loop()
 {
   if (WiFi.status() != WL_CONNECTED)
-  {
     connectWiFi();
-  }
   if (!mqtt.connected())
-  {
     connectMQTT();
-  }
   mqtt.loop();
 
   unsigned long now = millis();
   if (now - last_publish_ms >= PUBLISH_INTERVAL_MS)
   {
     last_publish_ms = now;
-    publishReading();
+
+    String ts = isoTimestamp();
+
+    NodeData nodes[NODE_COUNT];
+    size_t n = buildNodeData(nodes, NODE_COUNT);
+
+    Serial.printf("\n--- Publishing cycle (%u nodes) ---\n",
+                  (unsigned)n);
+    for (size_t i = 0; i < n; ++i)
+    {
+      publishNode(nodes[i], ts);
+    }
   }
 }

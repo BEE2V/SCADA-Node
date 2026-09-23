@@ -1,9 +1,11 @@
 #pragma once
+#include <stdint.h>
+#include <stddef.h>
 
 struct SensorReading
 {
-    float t1; // Sensor 1 (noisier, e.g. LM35/thermistor)
-    float t2; // Sensor 2 (more accurate, e.g. DS18B20)
+    float t1;
+    float t2;
 };
 
 struct GpsReading
@@ -13,9 +15,25 @@ struct GpsReading
     bool valid;
 };
 
-// Implemented by dummy_* or real_* depending on build flags
-void sensors_init();
-SensorReading sensors_read();
+struct NodeData
+{
+    char node_id[16];
+    double latitude;
+    double longitude;
+    SensorReading sensors;
+    float fused;
+    bool valid;
+    bool is_master; // true for master, false for LoRa nodes
+};
 
-void gps_init();
-GpsReading gps_read();
+// ----- Master's own sensors (dummy or real) -----
+void master_sensors_init();
+SensorReading master_sensors_read();
+
+// ----- Master's own GPS (dummy or real) -----
+void master_gps_init();
+GpsReading master_gps_read();
+
+// ----- Remote nodes via LoRa (dummy or real) -----
+void remote_nodes_init();
+size_t remote_nodes_read(NodeData *out, size_t max_count);
