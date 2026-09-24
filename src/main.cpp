@@ -6,180 +6,218 @@
 #include <string.h>
 
 #include "config.h"
-#include "sensor_interface.h"
-#include "fusion.h"
+#include "node_data.h"
+#include "remote_nodes.h"
 
 static WiFiClient espClient;
 static PubSubClient mqtt(espClient);
 
 static unsigned long last_publish_ms = 0;
+static unsigned long last_mqtt_attempt_ms = 0;
+static unsigned long last_wifi_attempt_ms = 0;
+static unsigned long last_heartbeat_ms = 0;
 
-// ================= WiFi =================
-static void connectWiFi()
+// ================= WiFi: NON-BLOCKING =================
+static bool ensureWiFi()
 {
-  Serial.printf("[WiFi] Connecting to %s\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    if (WiFi.status() == WL_CONNECTED)
+        return true;
 
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-    Serial.print(".");
-    if (millis() - start > 20000)
+    unsigned long now = millis();
+    if (now - last_wifi_attempt_ms < WIFI_RETRY_MS)
+        return false;
+    last_wifi_attempt_ms = now;
+
+    Serial.printf("[WiFi] Connecting to %s\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(50);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - start < WIFI_CONNECT_TIMEOUT_MS)
     {
-      Serial.println("\n[WiFi] Timeout, retrying...");
-      WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-      start = millis();
+        delay(200);
+        Serial.print(".");
     }
-  }
-  Serial.printf("\n[WiFi] Connected. IP: %s\n",
-                WiFi.localIP().toString().c_str());
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Serial.printf("[WiFi] Connected. IP: %s\n",
+                      WiFi.localIP().toString().c_str());
+        return true;
+    }
+
+    Serial.println("[WiFi] Attempt failed. Will retry later.");
+    return false;
 }
 
-// ================= MQTT =================
-static void connectMQTT()
+// ================= MQTT: NON-BLOCKING =================
+static void tryConnectMQTT()
 {
-  while (!mqtt.connected())
-  {
-    Serial.print("[MQTT] Connecting... ");
-    String clientId = String("xiao-master-") +
+    String clientId = String("xiao-gw-") +
                       String((uint32_t)esp_random(), HEX);
+    Serial.print("[MQTT] Connecting... ");
     if (mqtt.connect(clientId.c_str()))
     {
-      Serial.println("connected");
+        Serial.println("connected");
     }
     else
     {
-      Serial.printf("failed rc=%d, retrying in 2s\n", mqtt.state());
-      delay(2000);
+        Serial.printf("failed rc=%d (retry in %lus)\n",
+                      mqtt.state(), MQTT_RETRY_MS / 1000);
     }
-  }
 }
 
 // ================= Time =================
 static String isoTimestamp()
 {
-  time_t now = time(nullptr);
-  if (now < 100000)
-    return "1970-01-01T00:00:00Z";
+    time_t now = time(nullptr);
+    if (now < 100000)
+        return "1970-01-01T00:00:00Z";
 
-  struct tm tmv;
-  gmtime_r(&now, &tmv);
-  char buf[32];
-  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmv);
-  return String(buf);
+    struct tm tmv;
+    gmtime_r(&now, &tmv);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+    return String(buf);
 }
 
-// ================= Publish one node =================
+// ================= Publish =================
 static void publishNode(const NodeData &n, const String &ts)
 {
-  JsonDocument doc;
-  doc["node_id"] = n.node_id;
-  doc["timestamp"] = ts;
-  doc["latitude"] = n.latitude;
-  doc["longitude"] = n.longitude;
-  doc["gps_valid"] = n.valid;
-  doc["t1"] = n.sensors.t1;
-  doc["t2"] = n.sensors.t2;
-  doc["temperature"] = n.fused;
-  doc["rssi"] = WiFi.RSSI();
-  doc["source"] = n.is_master ? "self" : "lora";
+    JsonDocument doc;
+    doc["node_id"] = n.node_id;
+    doc["timestamp"] = ts;
+    doc["latitude"] = n.latitude;
+    doc["longitude"] = n.longitude;
+    doc["gps_valid"] = n.valid;
+    doc["t1"] = n.t1;
+    doc["t2"] = n.t2;
+    doc["temperature"] = n.temperature;
+    doc["lora_rssi"] = n.lora_rssi;
+    doc["wifi_rssi"] = WiFi.RSSI();
+    doc["source"] = "lora";
+    doc["gateway"] = "xiao_master";
 
-  char payload[512];
-  size_t len = serializeJson(doc, payload, sizeof(payload));
+    char payload[MQTT_BUFFER_SIZE];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
 
-  String topic = String(MQTT_TOPIC_PREFIX) + n.node_id + "/data";
+    String topic = String(MQTT_TOPIC_PREFIX) + n.node_id + "/data";
 
-  bool ok = mqtt.publish(topic.c_str(), payload, len);
-  Serial.printf("[PUB] %-28s %s\n", topic.c_str(), ok ? "ok" : "FAIL");
+    bool ok = mqtt.publish(topic.c_str(), payload, len);
+
+    Serial.printf("[PUB] %-32s %s  |  T=%.2f  len=%u\n",
+                  topic.c_str(),
+                  ok ? "ok  " : "FAIL",
+                  n.temperature,
+                  (unsigned)len);
 }
 
-// ================= Build all node data =================
-static size_t buildNodeData(NodeData *out, size_t max_count)
-{
-  size_t n = 0;
-
-  // ----- Master's own entry (index 0) -----
-  if (n < max_count)
-  {
-    NodeData &m = out[n];
-    strncpy(m.node_id, NODE_DEFS[MASTER_NODE_INDEX].node_id,
-            sizeof(m.node_id) - 1);
-    m.node_id[sizeof(m.node_id) - 1] = '\0';
-
-    GpsReading g = master_gps_read();
-    m.latitude = g.latitude;
-    m.longitude = g.longitude;
-    m.valid = g.valid;
-    m.sensors = master_sensors_read();
-    m.is_master = true;
-
-    fusion_set_slot(0);
-    m.fused = fuse_temperature(m.sensors);
-    ++n;
-  }
-
-  // ----- Remote LoRa nodes (index 1..N) -----
-  size_t remotes = remote_nodes_read(out + n, max_count - n);
-  for (size_t i = 0; i < remotes; ++i)
-  {
-    fusion_set_slot((int)(n + i));
-    out[n + i].fused = fuse_temperature(out[n + i].sensors);
-  }
-  n += remotes;
-
-  return n;
-}
-
-// ================= Arduino entry points =================
+// ================= Setup =================
 void setup()
 {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("\n=== EE2120 Master Gateway (XIAO ESP32S3) ===");
-  Serial.printf("Master ID   : %s\n", NODE_DEFS[0].node_id);
-  Serial.printf("Remote nodes: %u\n", (unsigned)REMOTE_NODE_COUNT);
-  Serial.printf("Dummy modes : sensors=%d gps=%d lora=%d\n",
-                (int)USE_DUMMY_SENSORS,
-                (int)USE_DUMMY_GPS,
-                (int)USE_DUMMY_REMOTE_NODES);
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("\n=== EE2120 Master Gateway (XIAO ESP32S3) ===");
+    Serial.printf("Remote nodes  : %u\n", (unsigned)REMOTE_NODE_COUNT);
+    Serial.printf("Dummy LoRa    : %d\n", (int)USE_DUMMY_REMOTE_NODES);
+    Serial.printf("Topic prefix  : %s\n", MQTT_TOPIC_PREFIX);
+    Serial.printf("MQTT buffer   : %d bytes\n", MQTT_BUFFER_SIZE);
 
-  master_sensors_init();
-  master_gps_init();
-  remote_nodes_init();
+    remote_nodes_init();
 
-  connectWiFi();
-  configTime(0, 0, NTP_SERVER); // UTC
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
+    {
+        delay(300);
+        Serial.print(".");
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Serial.printf("[WiFi] Connected. IP: %s\n",
+                      WiFi.localIP().toString().c_str());
+    }
+    else
+    {
+        Serial.println("[WiFi] Not connected at boot — will retry in loop()");
+    }
 
-  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-  mqtt.setKeepAlive(30);
+    configTime(0, 0, NTP_SERVER);
+
+    mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+    mqtt.setKeepAlive(30);
+    mqtt.setSocketTimeout(5);
+    mqtt.setBufferSize(MQTT_BUFFER_SIZE); // ← critical fix
+
+    randomSeed(esp_random());
 }
 
+// ================= Loop =================
 void loop()
 {
-  if (WiFi.status() != WL_CONNECTED)
-    connectWiFi();
-  if (!mqtt.connected())
-    connectMQTT();
-  mqtt.loop();
+    unsigned long now = millis();
 
-  unsigned long now = millis();
-  if (now - last_publish_ms >= PUBLISH_INTERVAL_MS)
-  {
-    last_publish_ms = now;
+    // 1. WiFi keep-alive
+    bool wifi_ok = ensureWiFi();
 
-    String ts = isoTimestamp();
-
-    NodeData nodes[NODE_COUNT];
-    size_t n = buildNodeData(nodes, NODE_COUNT);
-
-    Serial.printf("\n--- Publishing cycle (%u nodes) ---\n",
-                  (unsigned)n);
-    for (size_t i = 0; i < n; ++i)
+    // 2. MQTT keep-alive
+    if (wifi_ok)
     {
-      publishNode(nodes[i], ts);
+        if (!mqtt.connected())
+        {
+            if (now - last_mqtt_attempt_ms >= MQTT_RETRY_MS)
+            {
+                last_mqtt_attempt_ms = now;
+                tryConnectMQTT();
+            }
+        }
+        else
+        {
+            mqtt.loop();
+        }
     }
-  }
+
+    // 3. Heartbeat
+    if (now - last_heartbeat_ms >= HEARTBEAT_MS)
+    {
+        last_heartbeat_ms = now;
+        Serial.printf("[HB] up=%lus  WiFi=%s  MQTT=%s  heap=%u\n",
+                      now / 1000,
+                      WiFi.status() == WL_CONNECTED ? "yes" : "no ",
+                      mqtt.connected() ? "yes" : "no ",
+                      (unsigned)ESP.getFreeHeap());
+    }
+
+    // 4. Publish cycle
+    if (now - last_publish_ms >= PUBLISH_INTERVAL_MS)
+    {
+        last_publish_ms = now;
+
+        if (WiFi.status() == WL_CONNECTED && mqtt.connected())
+        {
+            String ts = isoTimestamp();
+
+            NodeData nodes[REMOTE_NODE_COUNT];
+            size_t n = remote_nodes_read(nodes, REMOTE_NODE_COUNT);
+
+            Serial.printf("\n--- Cycle: %u nodes ---\n", (unsigned)n);
+            for (size_t i = 0; i < n; ++i)
+            {
+                publishNode(nodes[i], ts);
+            }
+        }
+        else
+        {
+            Serial.println("[PUB] skipped (WiFi or MQTT down)");
+        }
+    }
+
+    // 5. Watchdog yield
+    delay(10);
 }
